@@ -25,6 +25,9 @@ paraseq = { version = "0.6", default-features = false, optional = true }
 sirocco = { version = "0.3", default-features = false, optional = true }
 zefiro = { version = "1.0", default-features = false, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", default-features = false }
+
 [dev-dependencies]
 fastx-gen = { path = "../fastx-gen" }
 flate2 = { version = "1.1", features = ["zlib-rs"] }

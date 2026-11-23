@@ -1,6 +1,6 @@
 //! Parallel decompression of independent compressed frames (BGZF blocks, zstd frames).
 
-use super::{FramesSource, Job, with_thread_file};
+use super::{DROP_CACHE_MIN_FILE_LEN, FramesSource, Job, drop_page_cache, with_thread_file};
 use crate::config::*;
 use crate::parser::*;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -402,12 +402,14 @@ where
     // `open(pos, limit)` gives the frames starting in `pos..limit` of the `len` compressed bytes.
     pub(super) fn run_frames<D: FrameDecoder, S: FrameSource>(
         &self,
+        source: FramesSource<'_>,
         len: usize,
         open: impl Fn(usize, usize) -> io::Result<S> + Sync,
         threads: usize,
         custom_chunks: Option<usize>,
         max_chunk_len: usize,
     ) -> Result<Vec<State>> {
+        let drop_cache = matches!(source, FramesSource::File(_)) && (len as u64) >= DROP_CACHE_MIN_FILE_LEN;
         let mut frames = open(0, len)?;
         let Some((first, first_bytes)) = frames.next_frame()? else {
             return self.run_single(FastxParser::from_slice(&[]));
@@ -441,7 +443,19 @@ where
                     pos: 0,
                     len: 0,
                 };
-                (self.process)(state, ticket, FastxParser::from_reader(reader)?)
+                let res = (self.process)(state, ticket, FastxParser::from_reader(reader)?);
+                if drop_cache && let FramesSource::File(path) = source {
+                    let drop_start = if start.1 > 0 {
+                        start.0.saturating_add(1 << 16)
+                    } else {
+                        start.0
+                    };
+                    let _ = with_thread_file(path, |file| {
+                        drop_page_cache(file, drop_start as u64, end.0 as u64);
+                        Ok(())
+                    });
+                }
+                res
             },
         )
     }

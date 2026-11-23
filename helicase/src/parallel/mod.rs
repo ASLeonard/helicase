@@ -19,6 +19,81 @@ use std::sync::{Mutex, OnceLock};
 /// Target bytes per chunk when a compressed stream is decompressed by a single thread
 const STREAM_CHUNK_LEN: usize = 4 << 20;
 
+/// Minimum input file size (256 MiB) before drop-behind page cache eviction is enabled.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) const DROP_CACHE_MIN_FILE_LEN: u64 = 256 << 20;
+
+/// Align drop-behind `POSIX_FADV_DONTNEED` ranges to 64 KiB so neighboring chunks never lose
+/// shared boundary pages across 4 KiB–64 KiB page sizes.
+const DROP_CACHE_ALIGN: u64 = 64 << 10;
+
+/// Stride (16 MiB) between `DropBehindFile` page cache evictions.
+const DROP_BEHIND_CHUNK_BYTES: u64 = 16 << 20;
+
+/// Computes inward `DROP_CACHE_ALIGN`-aligned `(offset, len)` strictly within `[start, end)`.
+#[cfg(any(target_os = "linux", test))]
+fn aligned_drop_range(start: u64, end: u64) -> Option<(u64, u64)> {
+    let aligned_start = start.checked_add(DROP_CACHE_ALIGN - 1)? & !(DROP_CACHE_ALIGN - 1);
+    let aligned_end = end & !(DROP_CACHE_ALIGN - 1);
+    (aligned_end > aligned_start).then(|| (aligned_start, aligned_end - aligned_start))
+}
+
+/// Drops clean page cache pages inside `[start, end)` on Linux (inward-aligned to `DROP_CACHE_ALIGN`).
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+pub(super) fn drop_page_cache(file: &File, start: u64, end: u64) {
+    #[cfg(target_os = "linux")]
+    if let Some((off, len)) = aligned_drop_range(start, end)
+        && let (Ok(off), Ok(len)) = (libc::off_t::try_from(off), libc::off_t::try_from(len))
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` holds an open descriptor; `posix_fadvise(POSIX_FADV_DONTNEED)` is advisory.
+        let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), off, len, libc::POSIX_FADV_DONTNEED) };
+    }
+}
+
+/// Sequential file reader that advises Linux to drop consumed page cache behind its cursor.
+struct DropBehindFile {
+    file: File,
+    pos: u64,
+    dropped_to: u64,
+    enabled: bool,
+}
+
+impl DropBehindFile {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let enabled = file.metadata()?.len() >= DROP_CACHE_MIN_FILE_LEN;
+        Ok(Self {
+            file,
+            pos: 0,
+            dropped_to: 0,
+            enabled,
+        })
+    }
+}
+
+impl Read for DropBehindFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.pos += n as u64;
+        if self.enabled {
+            if n == 0 {
+                if self.pos > self.dropped_to {
+                    drop_page_cache(&self.file, self.dropped_to, self.pos);
+                    self.dropped_to = self.pos;
+                }
+            } else if self.pos.saturating_sub(self.dropped_to) >= DROP_BEHIND_CHUNK_BYTES {
+                let end = self.pos & !(DROP_CACHE_ALIGN - 1);
+                if end > self.dropped_to {
+                    drop_page_cache(&self.file, self.dropped_to, end);
+                    self.dropped_to = end;
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
 /// Maximum bytes per chunk in [`ParallelFastxParser::process_parallel`], where a chunk is a batch
 #[cfg(feature = "paraseq")]
 const PARASEQ_MAX_CHUNK_LEN: usize = 16 << 20;
@@ -280,6 +355,7 @@ where
                 CompressionFormat::Bgzf => {
                     let len = frames::bgzf_input_len(source)?;
                     return self.run_frames::<frames::BgzfDecoder, _>(
+                        source,
                         len,
                         |pos, limit| frames::BgzfBlocks::new(source, pos, limit),
                         threads,
@@ -301,6 +377,7 @@ where
                     if let Some(zstd_frames) = zstd_frames.filter(|frames| frames.len() > 1) {
                         let len = zstd_frames.last().map_or(0, |f| f.comp_offset + f.comp_len);
                         return self.run_frames::<frames::ZstdDecoder, _>(
+                            source,
                             len,
                             |pos, limit| frames::ZstdFrames::new(source, &zstd_frames, pos, limit),
                             threads,
@@ -321,7 +398,7 @@ where
         }
         let reader: Box<dyn Read + Send + '_> = match source {
             FramesSource::Slice(slice) => Box::new(std::io::Cursor::new(slice)),
-            FramesSource::File(path) => Box::new(File::open(path)?),
+            FramesSource::File(path) => Box::new(DropBehindFile::open(path)?),
         };
         self.run_stream(decompress(reader, threads)?, threads, max_chunk_len)
     }
@@ -345,6 +422,7 @@ where
 
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
+        let drop_cache = file_len >= DROP_CACHE_MIN_FILE_LEN;
         if (threads == 1 && file_len <= max_chunk_len as u64) || file_len < 32 * 1024 {
             return self.run_single(FastxParser::from_file(path));
         }
@@ -369,7 +447,11 @@ where
                 with_thread_file(path, |file| {
                     file.seek(SeekFrom::Start(start))?;
                     let parser = FastxParser::from_reader(file.take(end - start))?;
-                    (self.process)(state, ticket, parser)
+                    let res = (self.process)(state, ticket, parser);
+                    if drop_cache {
+                        drop_page_cache(file, start, end);
+                    }
+                    res
                 })
             },
         )

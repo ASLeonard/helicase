@@ -87,3 +87,43 @@ fn thread_file_follows_path() {
     let _ = std::fs::remove_file(a);
     let _ = std::fs::remove_file(b);
 }
+
+#[test]
+fn drop_cache_range_aligns_inward() {
+    assert_eq!(aligned_drop_range(0, 0), None);
+    assert_eq!(aligned_drop_range(128 << 10, 64 << 10), None);
+    assert_eq!(aligned_drop_range(100, 64 << 10), None);
+    assert_eq!(
+        aligned_drop_range(0, 64 << 10),
+        Some((0, 64 << 10))
+    );
+    assert_eq!(
+        aligned_drop_range(1, (192 << 10) + 123),
+        Some((64 << 10, 128 << 10))
+    );
+    assert_eq!(aligned_drop_range(u64::MAX, u64::MAX), None);
+}
+
+#[test]
+fn drop_behind_file_reads_exact_bytes() {
+    let path = std::env::temp_dir().join("helicase_drop_behind_file_test");
+    let expected: Vec<u8> = (0..(200 << 10)).map(|i| (i * 13 + 7) as u8).collect();
+    std::fs::write(&path, &expected).unwrap();
+    let mut reader = DropBehindFile {
+        file: File::open(&path).unwrap(),
+        pos: 0,
+        dropped_to: 0,
+        enabled: true,
+    };
+    let mut actual = Vec::new();
+    let mut chunk = [0u8; 4093];
+    loop {
+        let n = reader.read(&mut chunk).unwrap();
+        if n == 0 {
+            break;
+        }
+        actual.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(actual, expected);
+    let _ = std::fs::remove_file(path);
+}
