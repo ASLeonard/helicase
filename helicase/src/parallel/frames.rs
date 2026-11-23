@@ -16,9 +16,9 @@ const WINDOW_LEN: usize = 1 << 18;
 // A block, then the header of the next one
 #[cfg(feature = "gz")]
 const RESYNC_LEN: usize = 2 * MAX_BGZF_BLOCK_LEN + 18;
-// The BGZF EOF marker, an empty block
+// Smallest valid BGZF block: 18-byte header + 2-byte empty deflate + 8-byte CRC32/ISIZE
 #[cfg(feature = "gz")]
-const EOF_BLOCK_LEN: usize = 28;
+const MIN_BGZF_BLOCK_LEN: usize = 28;
 
 #[derive(Clone, Copy)]
 pub struct Frame {
@@ -76,6 +76,7 @@ impl FrameDecoder for BgzfDecoder {
 fn bgzf_block_len(h: &[u8]) -> Option<usize> {
     (h.len() >= 18 && h[..4] == [0x1f, 0x8b, 8, 4] && h[10..16] == [6, 0, b'B', b'C', 2, 0])
         .then(|| u16::from_le_bytes([h[16], h[17]]) as usize + 1)
+        .filter(|&len| len >= MIN_BGZF_BLOCK_LEN)
 }
 
 // Block at the start of `h`, possibly empty (the BGZF EOF marker is).
@@ -104,27 +105,13 @@ fn read_at(path: &Path, buf: &mut Vec<u8>, offset: usize, len: usize) -> Result<
     })
 }
 
-// Length of the input if it ends with the BGZF EOF marker.
+// Length of the BGZF input; the trailing 28-byte EOF marker is optional.
 #[cfg(feature = "gz")]
-pub(super) fn bgzf_input_len(source: FramesSource<'_>) -> Result<Option<usize>> {
-    let is_eof_block = |tail: &[u8]| {
-        parse_bgzf_frame(tail, 0).is_some_and(|b| b.comp_len == EOF_BLOCK_LEN && b.uncomp_len == 0)
-    };
+pub(super) fn bgzf_input_len(source: FramesSource<'_>) -> Result<usize> {
     match source {
-        FramesSource::Slice(slice) => {
-            let tail = &slice[slice.len().saturating_sub(EOF_BLOCK_LEN)..];
-            Ok(is_eof_block(tail).then_some(slice.len()))
-        }
+        FramesSource::Slice(slice) => Ok(slice.len()),
         FramesSource::File(path) => {
-            let len = with_thread_file(path, |file| Ok(file.metadata()?.len() as usize))?;
-            let mut tail = Vec::new();
-            read_at(
-                path,
-                &mut tail,
-                len.saturating_sub(EOF_BLOCK_LEN),
-                EOF_BLOCK_LEN,
-            )?;
-            Ok(is_eof_block(&tail).then_some(len))
+            with_thread_file(path, |file| Ok(file.metadata()?.len() as usize))
         }
     }
 }

@@ -278,16 +278,14 @@ where
             match format {
                 #[cfg(feature = "gz")]
                 CompressionFormat::Bgzf => {
-                    // Without the BGZF EOF marker, a single decoder reads all the members
-                    if let Some(len) = frames::bgzf_input_len(source)? {
-                        return self.run_frames::<frames::BgzfDecoder, _>(
-                            len,
-                            |pos, limit| frames::BgzfBlocks::new(source, pos, limit),
-                            threads,
-                            custom_chunks,
-                            max_chunk_len,
-                        );
-                    }
+                    let len = frames::bgzf_input_len(source)?;
+                    return self.run_frames::<frames::BgzfDecoder, _>(
+                        len,
+                        |pos, limit| frames::BgzfBlocks::new(source, pos, limit),
+                        threads,
+                        custom_chunks,
+                        max_chunk_len,
+                    );
                 }
                 #[cfg(feature = "zstd")]
                 CompressionFormat::Zstd | CompressionFormat::Pzstd => {
